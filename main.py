@@ -21,10 +21,8 @@ from matplotlib.widgets import Button, RadioButtons, Slider
 
 # ---------------------------------------------------------------- constants
 MU0 = 4e-7 * np.pi        # vacuum permeability, T*m/A
-WIRE_RADIUS = 0.5e-3      # m; softens 1/r^2 so points on a wire stay finite
 N_EVAL = 41               # field grid is N_EVAL x N_EVAL points
-MAX_SEGS = 4000           # cap on total segments (bounds the rebuild time)
-N_DOTS = 6               # flow dots per wire
+N_DOTS = 6                # flow dots per wire
 DOT_SPEED = 0.01          # fraction of wire length per frame at full current
 DT = 0.04                 # simulated seconds per frame (matches interval=40 ms)
 SNAPS = {"1 m": 1.0, "1 cm": 0.01, "1 mm": 0.001}
@@ -84,8 +82,8 @@ def field_per_amp(px, py, h, mids, dls, chunk=256):
         ry = py[:, None] - m[None, :, 1]
 
         # 1 / (R² + a²)^(3/2), where R² = rx² + ry² + h² is the squared 3D distance
-        # and a² = WIRE_RADIUS² as a failsafe so the radius is never 0
-        inv_r3 = (rx ** 2 + ry ** 2 + h ** 2 + WIRE_RADIUS ** 2) ** -1.5
+        # WIRE_RADIUS has been phased out as it effectively did nothing
+        inv_r3 = (rx ** 2 + ry ** 2 + h ** 2) ** -1.5
 
         # Current-direction components of each segment, shape (1, chunk) so they broadcast over grid points
         dx, dy = d[None, :, 0], d[None, :, 1]
@@ -112,6 +110,7 @@ class WireSim:
         self.paths = []            # per wire: (vertices, cumulative length)
         self.phase = 0.0           # flow-dot phase, fraction of a wire
         self.log_scale = False     # which colour norm the image currently has
+        self.unit_direction = False # Toggle for the direction arrows magnitude
 
         self._build_figure()
         self._build_widgets()
@@ -149,6 +148,9 @@ class WireSim:
                                    ("DC", "AC"), active=1)
         self.r_scale = RadioButtons(f.add_axes([0.01, 0.40, 0.1, 0.10]),
                                     ("Linear", "Log"))
+
+        self.b_dynamic = RadioButtons(f.add_axes([0.8, 0.72, 0.1, 0.13]),
+                                    ("Dynamic", "Fixed"))
         self.b_new = Button(f.add_axes([0.01, 0.31, 0.1, 0.05]), "New wire")
         self.b_clear = Button(f.add_axes([0.01, 0.24, 0.1, 0.05]), "Clear all")
 
@@ -159,7 +161,7 @@ class WireSim:
         self.s_f = slider(0.18, "Frequency (Hz)", 0.1, 5.0, 0.5)
         self.s_h = slider(0.14, "Probe height (m)", 0.001, 10.0, 0.5)
         self.s_R = slider(0.10, "Axis Dimensions (m)", 0.05, 20.0, 5.0)
-        self.s_seg = slider(0.06, "Max segment (mm)", 1, 100, 10, valstep=1)
+        self.s_seg = slider(0.06, "Min segment (mm)", 1, 1000, 10, valstep=1)
 
     def _connect_events(self):
         canvas = self.fig.canvas
@@ -243,24 +245,26 @@ class WireSim:
     def recompute(self):
         """Rebuild the 1 A field grid and flow paths from the current wires. This
         is the most computationally heavy portion and has room for improvement."""
-        half = self.s_R.val
-        xs = np.linspace(-half, half, N_EVAL)
+        axis = self.s_R.val
+        xs = np.linspace(-axis, axis, N_EVAL)
         X, Y = np.meshgrid(xs, xs)
         self.grid_x, self.grid_y = X.ravel(), Y.ravel()
 
         # Update view: image extent, axis limits, arrow anchor points.
-        self.im.set_extent([-half, half, -half, half])
-        self.ax.set_xlim(-half, half)
-        self.ax.set_ylim(-half, half)
+        self.im.set_extent([-axis, axis, -axis, axis])
+        self.ax.set_xlim(-axis, axis)
+        self.ax.set_ylim(-axis, axis)
         self.quiver.set_offsets(np.column_stack([self.grid_x, self.grid_y]))
 
         wires = [np.array(w, float) for w in self.wires if len(w) >= 2]
-        total = sum(np.hypot(*np.diff(w, axis=0).T).sum() for w in wires)
-        seg = max(self.s_seg.val / 1000.0, total / MAX_SEGS)
+        # total = sum(np.hypot(*np.diff(w, axis=0).T).sum() for w in wires)
+        # Although now unused, you can find the total length of all the wires combined
+        # with this variable "total"
 
         mids, dls, self.paths = [], [], []
         for w in wires:
-            m, d = splitwires(w, seg)
+            m, d = splitwires(w, (self.s_seg.val/1000))
+            # divide by 1000 here to convert into mm
             mids.append(m)
             dls.append(d)
             cumulative = np.concatenate([[0.0],
@@ -297,6 +301,8 @@ class WireSim:
         self.im.set_data(mag)
         self.im.set_clim(lo, hi)
 
+        dynamic = self.b_dynamic.value_selected == "Dynamic"
+
         # Arrow length uses the same mapping as the colour scale (0..1).
         if log:
             frac = np.log(np.maximum(mag, lo) / lo) / np.log(hi / lo)
@@ -305,7 +311,10 @@ class WireSim:
         frac = np.clip(frac, 0.0, 1.0)
 
         cell = 2 * self.s_R.val / (N_EVAL - 1)
-        length = (0.15 + 0.85 * frac) * 0.9 * cell    # 0.15 floor keeps direction visible
+        if dynamic:
+            length = (0.85 * frac) * 0.9 * cell    # 0.15 floor keeps direction visible
+        else:
+            length = 0.2
         inplane = np.maximum(np.hypot(Bx, By), 1e-30)
         self.quiver.set_UVC((Bx / inplane * length).ravel(),
                             (By / inplane * length).ravel())
@@ -328,19 +337,19 @@ class WireSim:
         if self.dirty:
             self.recompute()
         amp = self.s_I.val
-        ac = self.r_mode.value_selected == "AC"
+        ac = (self.r_mode.value_selected == "AC")
         I = amp * np.sin(2 * np.pi * self.s_f.val * frame * DT) if ac else amp
+        # Current in DC is just amplitude, the sine here is for AC.
         self.render_field(I)
         self.render_flow(I, amp)
         n = sum(len(w) >= 2 for w in self.wires)
         self.title.set_text(f"{'AC' if ac else 'DC'}: I = {I:+.2f} A   {n} wire(s)   "
                             f"n: new, u: undo, c: clear")
-        return (self.im, self.quiver, self.flow, self.title,
-                self.wire_line, self.preview, self.cursor_dot)
+        return (self.im, self.quiver, self.flow, self.title, self.wire_line, self.preview, self.cursor_dot)
 
 
 if __name__ == "__main__":
     sim = WireSim()
-    sim.ani = FuncAnimation(sim.fig, sim.update, interval=int(DT * 1000),cache_frame_data=False, blit=True)
-    #Note that blit makes the grid flash white for reasons i don't know, but it improves the framerate enough to tolerate
+    sim.ani = FuncAnimation(sim.fig, sim.update, interval=int(DT * 1000),cache_frame_data=True)
+    # On further testing do not enable blit as it creates too many bugs.
     plt.show()
